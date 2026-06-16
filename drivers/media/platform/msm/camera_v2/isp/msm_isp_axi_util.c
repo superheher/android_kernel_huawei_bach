@@ -3422,6 +3422,8 @@ int msm_isp_update_axi_stream(struct vfe_device *vfe_dev, void *arg)
 			update_cmd->update_type !=
 			UPDATE_STREAM_REQUEST_FRAMES &&
 			update_cmd->update_type !=
+			UPDATE_STREAM_REQUEST_FRAMES_VER2 &&
+			update_cmd->update_type !=
 			UPDATE_STREAM_REMOVE_BUFQ &&
 			update_cmd->update_type !=
 			UPDATE_STREAM_SW_FRAME_DROP) {
@@ -3589,6 +3591,39 @@ int msm_isp_update_axi_stream(struct vfe_device *vfe_dev, void *arg)
 		}
 		break;
 	}
+	/*
+	 * LOS18/A11: the A11 mm-camera daemon issues per-frame buffer requests
+	 * with UPDATE_STREAM_REQUEST_FRAMES_VER2, which this 3.18 kernel's switch
+	 * did not handle -> rejected with -EINVAL. Accepting it (below) stops that
+	 * rejection; see fix v2 in the case body for the correct VER2 struct parse.
+	 */
+	case UPDATE_STREAM_REQUEST_FRAMES_VER2: {
+		/*
+		 * LOS18/A11 fix v2: the A11 daemon's VER2 per-frame request stores
+		 * its payload in the union member req_frm_ver2
+		 * {stream_handle, user_stream_id, frame_id, buf_index} -- a DIFFERENT
+		 * layout from update_info[] {stream_handle, output_format,
+		 * user_stream_id, frame_id, ...}. Only stream_handle aligns (by
+		 * design). Reading VER2 as update_info[] scrambled the fields:
+		 * frame_id got buf_index (small -> always <= cur frame_id -> "stale"
+		 * early return -> empty buffer) and user_stream_id got the real
+		 * frame_id (!= stream_id -> picked the unregistered SHARED bufq ->
+		 * "Invalid bufq" -> ISP returned an EMPTY buffer -> solid-green
+		 * snapshot). Parse the correct struct so request_frame sees a valid
+		 * frame_id and selects the DEFAULT bufq. buf_index is left to the
+		 * kernel's auto buffer selection; buf_done reports the actual buf_idx.
+		 */
+		struct msm_vfe_axi_stream_cfg_update_info_req_frm *req_frm =
+			&update_cmd->req_frm_ver2;
+		stream_info = &axi_data->stream_info[HANDLE_TO_IDX(
+			req_frm->stream_handle)];
+		rc = msm_isp_request_frame(vfe_dev, stream_info,
+			req_frm->user_stream_id, req_frm->frame_id);
+		if (rc)
+			pr_err("%s failed to request frame (ver2)!\n",
+				__func__);
+		break;
+	}
 	case UPDATE_STREAM_REQUEST_FRAMES: {
 		for (i = 0; i < update_cmd->num_streams; i++) {
 			update_info =
@@ -3661,7 +3696,8 @@ int msm_isp_update_axi_stream(struct vfe_device *vfe_dev, void *arg)
 		break;
 	}
 	default:
-		pr_err("%s: Invalid update type\n", __func__);
+		pr_err("%s: Invalid update type %d\n", __func__,
+			update_cmd->update_type);
 		return -EINVAL;
 	}
 
